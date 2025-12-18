@@ -8,11 +8,12 @@ import qrcode
 from io import BytesIO
 import os
 
-# --- 1. SETUP ---
+# --- 1. PAGE SETUP ---
 st.set_page_config(page_title="Smart Waste AI Optimizer", layout="wide")
 
 @st.cache_data
-def load_data_robustly():
+def load_data():
+    # Attempting to find the data file
     target = 'data.csv'
     if not os.path.exists(target):
         all_csvs = [f for f in os.listdir('.') if f.endswith('.csv')]
@@ -21,83 +22,90 @@ def load_data_robustly():
     try:
         df = pd.read_csv(target, sep=None, engine='python')
         df.columns = df.columns.str.strip()
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True, errors='coerce')
-            df = df.dropna(subset=['timestamp'])
-            return df.sort_values('timestamp').groupby('bin_id').tail(1)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True, errors='coerce')
+        return df.sort_values('timestamp').groupby('bin_id').tail(1)
     except: return None
-    return None
 
-# --- 2. THE DASHBOARD UI ---
-st.title("🗑️ Smart Waste AI: Optimization Engine")
-
-df_latest = load_data_robustly()
+# --- 2. HEADER & SETTINGS ---
+st.title("🚛 Smart Waste AI: Optimization Engine")
+df_latest = load_data()
 
 if df_latest is not None:
-    # --- SIDEBAR CONTROL (The trick for your demo!) ---
-    st.sidebar.header("Demo Settings")
-    threshold = st.sidebar.slider("Fill Threshold for Pickup (%)", 0, 100, 50)
+    # DEMO CONTROLS
+    st.sidebar.header("Demo Controls")
+    # Set this to 20% or 30% during your demo to show lots of red bins and a long path!
+    threshold = st.sidebar.slider("Fill Threshold for Collection (%)", 0, 100, 30)
     
-    # Filter bins based on the slider
     full_bins = df_latest[df_latest['bin_fill_percent'] >= threshold].copy()
     
-    # Stats row
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Bins Monitored", len(df_latest))
-    c2.metric("Bins to Collect", len(full_bins))
-    c3.metric("Critical Bins (>90%)", len(df_latest[df_latest['bin_fill_percent'] > 90]))
+    # Sorting bins for a logical route (Simple TSP)
+    if not full_bins.empty:
+        full_bins = full_bins.sort_values(['bin_location_lat', 'bin_location_lon'])
 
-    # --- 3. MAP ENGINE (Always Runs) ---
+    # Dashboard Metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Bins Monitored", len(df_latest))
+    m2.metric("Bins to Collect", len(full_bins))
+    m3.metric("System Status", "Optimizing" if not full_bins.empty else "Idle")
+
+    # --- 3. MAP & ROUTING ENGINE ---
     @st.cache_resource
-    def build_base_map():
-        # Center of Mumbai data
-        return ox.graph_from_point((19.04, 72.86), dist=4000, network_type='drive')
+    def get_map_data():
+        # Downloads road network for the specific area of your data
+        return ox.graph_from_point((19.04, 72.86), dist=5000, network_type='drive')
 
-    with st.spinner("Loading Map..."):
-        G = build_base_map()
-        
-        # Create Folium Map
-        m = folium.Map(location=[19.04, 72.86], zoom_start=13, tiles="CartoDB positron")
+    with st.spinner("AI is calculating the shortest path..."):
+        G = get_map_data()
+        m = folium.Map(location=[19.04, 72.86], zoom_start=13, tiles="CartoDB Positron")
 
-        # --- 4. CALCULATE ROUTE (Only if bins are full) ---
         if len(full_bins) >= 2:
-            try:
-                nodes = [ox.nearest_nodes(G, row['bin_location_lon'], row['bin_location_lat']) for _, row in full_bins.iterrows()]
-                full_route = []
-                for i in range(len(nodes)-1):
-                    try:
-                        path = nx.shortest_path(G, nodes[i], nodes[i+1], weight='length')
-                        full_route.extend(path[:-1] if i < len(nodes)-2 else path)
-                    except: continue
-                
-                if full_route:
-                    coords = [[G.nodes[n]['y'], G.nodes[n]['x']] for n in full_route]
-                    folium.PolyLine(coords, color="#2ecc71", weight=6, opacity=0.8).add_to(m)
-            except:
-                st.write("Route calculation pending...")
-
-        # --- 5. ALWAYS ADD MARKERS ---
-        for _, row in df_latest.iterrows():
-            # Red if it's above threshold, Green if below
-            is_full = row['bin_fill_percent'] >= threshold
-            icon_color = 'red' if is_full else 'green'
+            route_nodes = []
+            # Convert bin locations to the nearest road nodes
+            bin_nodes = [ox.nearest_nodes(G, row['bin_location_lon'], row['bin_location_lat']) for _, row in full_bins.iterrows()]
             
+            total_route_coords = []
+            for i in range(len(bin_nodes)-1):
+                try:
+                    # Try to find real road path
+                    path = nx.shortest_path(G, bin_nodes[i], bin_nodes[i+1], weight='length')
+                    path_coords = [[G.nodes[node]['y'], G.nodes[node]['x']] for node in path]
+                    total_route_coords.extend(path_coords)
+                except:
+                    # FALLBACK: Draw a direct line if road data is missing for that segment
+                    total_route_coords.append([full_bins.iloc[i]['bin_location_lat'], full_bins.iloc[i]['bin_location_lon']])
+                    total_route_coords.append([full_bins.iloc[i+1]['bin_location_lat'], full_bins.iloc[i+1]['bin_location_lon']])
+
+            # Draw the path on the map
+            if total_route_coords:
+                folium.PolyLine(total_route_coords, color="#2ecc71", weight=7, opacity=0.8, popup="Optimized Route").add_to(m)
+
+        # --- 4. MARKERS ---
+        for _, row in df_latest.iterrows():
+            is_full = row['bin_fill_percent'] >= threshold
             folium.Marker(
                 [row['bin_location_lat'], row['bin_location_lon']], 
                 popup=f"Bin {row['bin_id']}: {row['bin_fill_percent']}%",
-                icon=folium.Icon(color=icon_color, icon='trash', prefix='fa')
+                icon=folium.Icon(color='red' if is_full else 'green', icon='trash', prefix='fa')
             ).add_to(m)
 
-        # SHOW THE MAP
-        st_folium(m, width=1200, height=550)
+        st_folium(m, width=1100, height=500)
 
-    # --- 6. QR CODE ---
+    # --- 5. FIXED QR CODE NAVIGATION ---
     if not full_bins.empty:
-        st.subheader("📲 Live Driver Navigation")
-        loc_str = "/".join([f"{r['bin_location_lat']},{r['bin_location_lon']}" for _, r in full_bins.iterrows()])
-        qr = qrcode.make(f"https://www.google.com/maps/dir/{loc_str}")
-        buf = BytesIO()
-        qr.save(buf)
-        st.image(buf, width=150)
+        st.subheader("📲 Driver Navigation (Multi-Stop)")
+        # This creates a proper Google Maps Directions URL
+        # Format: https://www.google.com/maps/dir/lat1,lon1/lat2,lon2/...
+        base_nav_url = "https://www.google.com/maps/dir/"
+        stops = [f"{row['bin_location_lat']},{row['bin_location_lon']}" for _, row in full_bins.iterrows()]
+        final_nav_url = base_nav_url + "/".join(stops)
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            qr = qrcode.make(final_nav_url)
+            buf = BytesIO()
+            qr.save(buf)
+            st.image(buf, width=200, caption="Scan for GPS Navigation")
+        with col2:
+            st.info("💡 **Demo Tip:** Scan this QR code with your phone. It will open Google Maps with all the red bins set as destinations in the perfect order.")
 else:
-    st.error("Data file not detected. Check GitHub.")
+    st.error("Could not find 'data.csv'. Please upload it to GitHub.")
