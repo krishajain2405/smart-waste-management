@@ -1,0 +1,8 @@
+streamlit
+pandas
+osmnx
+networkx
+folium
+streamlit-folium
+qrcode
+pillow
