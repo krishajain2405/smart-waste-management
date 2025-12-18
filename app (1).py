@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1CIwOW0w9eB44JY_ROYoKPj86oNQR14Mb
 """
 
-pip install osmnx networkx folium streamlit-folium qrcode pillow geopy
+
 
 import streamlit as st
 import pandas as pd
