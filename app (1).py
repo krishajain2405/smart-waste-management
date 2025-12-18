@@ -8,58 +8,60 @@ import qrcode
 from io import BytesIO
 import os
 
-st.set_page_config(page_title="Smart Waste Dashboard", layout="wide")
+st.set_page_config(page_title="Smart Waste Optimizer", layout="wide")
 
-# --- 1. SMART DATA LOADING ---
+# --- 1. SMART & SAFE DATA LOADING ---
 @st.cache_data
 def load_custom_data():
-    # List of possible names the file might have
-    possible_names = [
-        'data.csv', 
-        'cleaned_data_with_fuel_weight_co2 (1).xlsx - Sheet1.csv',
-        'cleaned_data_with_fuel_weight_co2 (1).csv'
-    ]
+    # We will try to find your file
+    target_file = 'data.csv'
     
-    df = None
-    for name in possible_names:
-        if os.path.exists(name):
-            df = pd.read_csv(name)
-            break
-            
-    if df is None:
-        # If still not found, list all files to help debug
-        files_in_dir = os.listdir('.')
-        st.error(f"❌ Could not find the data file. Files present in your GitHub: {files_in_dir}")
-        return None
-        
-    # Get the latest status for each bin
-    latest = df.sort_values('timestamp').groupby('bin_id').tail(1)
-    return latest
+    if not os.path.exists(target_file):
+        # If data.csv isn't there, let's look for ANY csv file in the folder
+        all_files = [f for f in os.listdir('.') if f.endswith('.csv')]
+        if all_files:
+            target_file = all_files[0]
+        else:
+            st.error("❌ No CSV files found! Please upload your data to GitHub.")
+            return None
 
-# --- 2. THE REST OF YOUR LOGIC ---
+    # Check if the file is empty before reading
+    if os.path.getsize(target_file) == 0:
+        st.error(f"❌ The file '{target_file}' is empty! Please paste your data into it on GitHub.")
+        return None
+
+    try:
+        st.info(f"Reading data from: {target_file}")
+        df = pd.read_csv(target_file)
+        # Get the latest status for each bin
+        latest = df.sort_values('timestamp').groupby('bin_id').tail(1)
+        return latest
+    except Exception as e:
+        st.error(f"❌ Error reading the file: {e}")
+        return None
+
+# --- 2. THE DASHBOARD ---
 df_latest = load_custom_data()
 
 if df_latest is not None:
-    # Filter for full bins
+    # Filter for bins that are more than 75% full
     full_bins = df_latest[df_latest['bin_fill_percent'] > 75].copy()
 
-    st.title("🚛 Smart Waste Management: AI Route Optimizer")
+    st.title("🚛 Smart Waste Management Optimizer")
     
-    # Check if there are any full bins to show
     if full_bins.empty:
-        st.warning("All bins are currently empty or below 75% fill capacity.")
+        st.warning("✅ Great news! No bins currently need collection (all below 75%).")
     else:
-        st.success(f"Dashboard Active: Routing to {len(full_bins)} full bins.")
+        st.success(f"Action Required: Found {len(full_bins)} full bins.")
 
-        # --- 3. MAP CALCULATION ---
+        # --- 3. MAP ---
         @st.cache_resource
         def get_mumbai_map():
-            return ox.graph_from_point((19.04, 72.86), dist=3500, network_type='drive')
+            # Centers on your data points
+            return ox.graph_from_point((19.04, 72.86), dist=3000, network_type='drive')
 
-        with st.spinner("Analyzing road network for the best path..."):
+        with st.spinner("Calculating shortest path for the garbage truck..."):
             G = get_mumbai_map()
-            
-            # Find nearest road points for our bins
             nodes = [ox.nearest_nodes(G, row['bin_location_lon'], row['bin_location_lat']) 
                      for idx, row in full_bins.iterrows()]
             
@@ -68,30 +70,24 @@ if df_latest is not None:
                 try:
                     path = nx.shortest_path(G, nodes[i], nodes[i+1], weight='length')
                     full_route.extend(path[:-1] if i < len(nodes)-2 else path)
-                except:
-                    continue
+                except: continue
 
-            # --- 4. DISPLAY MAP ---
-            m = folium.Map(location=[19.04, 72.86], zoom_start=14, tiles="CartoDB positron")
-            
+            # Create Map
+            m = folium.Map(location=[19.04, 72.86], zoom_start=14)
             if full_route:
                 route_coords = [[G.nodes[n]['y'], G.nodes[n]['x']] for n in full_route]
-                folium.PolyLine(route_coords, color="#2ecc71", weight=6, opacity=0.8).add_to(m)
+                folium.PolyLine(route_coords, color="green", weight=5).add_to(m)
 
             for idx, row in full_bins.iterrows():
-                folium.Marker(
-                    [row['bin_location_lat'], row['bin_location_lon']], 
-                    popup=f"Bin {row['bin_id']}: {row['bin_fill_percent']}% Full",
-                    icon=folium.Icon(color='red', icon='trash', prefix='fa')
-                ).add_to(m)
+                folium.Marker([row['bin_location_lat'], row['bin_location_lon']], 
+                              popup=f"Bin {row['bin_id']}: {row['bin_fill_percent']}%").add_to(m)
 
-            st_folium(m, width=1200, height=500)
+            st_folium(m, width=1000)
 
-        # --- 5. DRIVER UTILITY ---
-        st.subheader("📲 Driver Navigation")
-        qr_url = "http://maps.google.com/maps?saddr=" + f"{full_bins.iloc[0]['bin_location_lat']},{full_bins.iloc[0]['bin_location_lon']}" + "&daddr=" + "+to:".join([f"{r['bin_location_lat']},{r['bin_location_lon']}" for i, r in full_bins.iloc[1:].iterrows()])
-        
-        qr = qrcode.make(qr_url)
+        # --- 4. QR CODE ---
+        st.subheader("📲 Driver QR Route")
+        nav_url = "https://www.google.com/maps/dir/" + "/".join([f"{r['bin_location_lat']},{r['bin_location_lon']}" for i, r in full_bins.iterrows()])
+        qr = qrcode.make(nav_url)
         buf = BytesIO()
         qr.save(buf)
-        st.image(buf, width=200, caption="Scan to start navigation")
+        st.image(buf, width=200, caption="Scan to open in Google Maps")
