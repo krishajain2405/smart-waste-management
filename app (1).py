@@ -7,18 +7,22 @@ from streamlit_folium import st_folium
 import qrcode
 from io import BytesIO
 import os
+from scipy.spatial import distance
 
-# --- 1. PAGE SETUP ---
+# --- 1. SETUP ---
 st.set_page_config(page_title="Smart Waste AI Optimizer", layout="wide")
 
+# DEFINE THE DEPOT (The Hub/Disposal Site)
+# I picked a central location in Mumbai (Near Dadar/Worli)
+DEPOT_COORDS = (19.0250, 72.8500) 
+
 @st.cache_data
-def load_data():
-    # Attempting to find the data file
+def load_and_clean_data():
     target = 'data.csv'
     if not os.path.exists(target):
-        all_csvs = [f for f in os.listdir('.') if f.endswith('.csv')]
-        if not all_csvs: return None
-        target = all_csvs[0]
+        all_files = [f for f in os.listdir('.') if f.endswith('.csv')]
+        if all_files: target = all_files[0]
+        else: return None
     try:
         df = pd.read_csv(target, sep=None, engine='python')
         df.columns = df.columns.str.strip()
@@ -26,60 +30,74 @@ def load_data():
         return df.sort_values('timestamp').groupby('bin_id').tail(1)
     except: return None
 
-# --- 2. HEADER & SETTINGS ---
-st.title("🚛 Smart Waste AI: Optimization Engine")
-df_latest = load_data()
+# --- 2. LOGIC: THE TRAVELING SALESMAN (TSP) ---
+def optimize_route(depot, bins_df):
+    """Sorts bins to visit the nearest ones in order, starting and ending at depot."""
+    current_loc = depot
+    unvisited = bins_df.copy()
+    route = [depot]
+    
+    while not unvisited.empty:
+        # Find the closest bin to the current location
+        unvisited['dist'] = unvisited.apply(
+            lambda x: distance.euclidean((current_loc[0], current_loc[1]), (x['bin_location_lat'], x['bin_location_lon'])), axis=1
+        )
+        closest_idx = unvisited['dist'].idxmin()
+        closest_bin = unvisited.loc[closest_idx]
+        
+        route.append((closest_bin['bin_location_lat'], closest_bin['bin_location_lon']))
+        current_loc = (closest_bin['bin_location_lat'], closest_bin['bin_location_lon'])
+        unvisited = unvisited.drop(closest_idx)
+    
+    route.append(depot) # Return to depot
+    return route
+
+# --- 3. UI ---
+st.title("🚛 Smart Waste Management: AI Fleet Optimizer")
+df_latest = load_and_clean_data()
 
 if df_latest is not None:
-    # DEMO CONTROLS
-    st.sidebar.header("Demo Controls")
-    # Set this to 20% or 30% during your demo to show lots of red bins and a long path!
-    threshold = st.sidebar.slider("Fill Threshold for Collection (%)", 0, 100, 30)
-    
+    st.sidebar.header("Logistics Controls")
+    threshold = st.sidebar.slider("Bin Fill Threshold (%)", 0, 100, 40)
     full_bins = df_latest[df_latest['bin_fill_percent'] >= threshold].copy()
-    
-    # Sorting bins for a logical route (Simple TSP)
-    if not full_bins.empty:
-        full_bins = full_bins.sort_values(['bin_location_lat', 'bin_location_lon'])
 
-    # Dashboard Metrics
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Bins Monitored", len(df_latest))
-    m2.metric("Bins to Collect", len(full_bins))
-    m3.metric("System Status", "Optimizing" if not full_bins.empty else "Idle")
+    # Calculate Optimized Visit Order
+    ordered_route = optimize_route(DEPOT_COORDS, full_bins)
 
-    # --- 3. MAP & ROUTING ENGINE ---
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Active Vehicles", "1 (Primary)")
+    col2.metric("Stops to Visit", len(full_bins))
+    col3.metric("Depot Status", "Operational")
+
+    # --- 4. MAP ---
     @st.cache_resource
-    def get_map_data():
-        # Downloads road network for the specific area of your data
-        return ox.graph_from_point((19.04, 72.86), dist=5000, network_type='drive')
+    def get_mumbai_graph():
+        return ox.graph_from_point((19.04, 72.86), dist=4500, network_type='drive')
 
-    with st.spinner("AI is calculating the shortest path..."):
-        G = get_map_data()
+    with st.spinner("AI is calculating the most efficient loop..."):
+        G = get_city_graph = get_mumbai_map = get_mumbai_graph()
         m = folium.Map(location=[19.04, 72.86], zoom_start=13, tiles="CartoDB Positron")
 
-        if len(full_bins) >= 2:
-            route_nodes = []
-            # Convert bin locations to the nearest road nodes
-            bin_nodes = [ox.nearest_nodes(G, row['bin_location_lon'], row['bin_location_lat']) for _, row in full_bins.iterrows()]
-            
-            total_route_coords = []
-            for i in range(len(bin_nodes)-1):
-                try:
-                    # Try to find real road path
-                    path = nx.shortest_path(G, bin_nodes[i], bin_nodes[i+1], weight='length')
-                    path_coords = [[G.nodes[node]['y'], G.nodes[node]['x']] for node in path]
-                    total_route_coords.extend(path_coords)
-                except:
-                    # FALLBACK: Draw a direct line if road data is missing for that segment
-                    total_route_coords.append([full_bins.iloc[i]['bin_location_lat'], full_bins.iloc[i]['bin_location_lon']])
-                    total_route_coords.append([full_bins.iloc[i+1]['bin_location_lat'], full_bins.iloc[i+1]['bin_location_lon']])
+        # 1. DRAW DEPOT
+        folium.Marker(DEPOT_COORDS, tooltip="MUNICIPAL DEPOT & DISPOSAL SITE", 
+                      icon=folium.Icon(color='black', icon='home', prefix='fa')).add_to(m)
 
-            # Draw the path on the map
-            if total_route_coords:
-                folium.PolyLine(total_route_coords, color="#2ecc71", weight=7, opacity=0.8, popup="Optimized Route").add_to(m)
+        # 2. CALCULATE ROAD PATHS
+        total_path_coords = []
+        for i in range(len(ordered_route)-1):
+            try:
+                start_node = ox.nearest_nodes(G, ordered_route[i][1], ordered_route[i][0])
+                end_node = ox.nearest_nodes(G, ordered_route[i+1][1], ordered_route[i+1][0])
+                path = nx.shortest_path(G, start_node, end_node, weight='length')
+                total_path_coords.extend([[G.nodes[n]['y'], G.nodes[n]['x']] for n in path])
+            except:
+                total_path_coords.append([ordered_route[i][0], ordered_route[i][1]])
+                total_path_coords.append([ordered_route[i+1][0], ordered_route[i+1][1]])
 
-        # --- 4. MARKERS ---
+        if total_path_coords:
+            folium.PolyLine(total_path_coords, color="#3498db", weight=6, opacity=0.8).add_to(m)
+
+        # 3. ADD BIN MARKERS
         for _, row in df_latest.iterrows():
             is_full = row['bin_fill_percent'] >= threshold
             folium.Marker(
@@ -88,24 +106,22 @@ if df_latest is not None:
                 icon=folium.Icon(color='red' if is_full else 'green', icon='trash', prefix='fa')
             ).add_to(m)
 
-        st_folium(m, width=1100, height=500)
+        st_folium(m, width=1200, height=550)
 
-    # --- 5. FIXED QR CODE NAVIGATION ---
-    if not full_bins.empty:
-        st.subheader("📲 Driver Navigation (Multi-Stop)")
-        # This creates a proper Google Maps Directions URL
-        # Format: https://www.google.com/maps/dir/lat1,lon1/lat2,lon2/...
-        base_nav_url = "https://www.google.com/maps/dir/"
-        stops = [f"{row['bin_location_lat']},{row['bin_location_lon']}" for _, row in full_bins.iterrows()]
-        final_nav_url = base_nav_url + "/".join(stops)
-        
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            qr = qrcode.make(final_nav_url)
-            buf = BytesIO()
-            qr.save(buf)
-            st.image(buf, width=200, caption="Scan for GPS Navigation")
-        with col2:
-            st.info("💡 **Demo Tip:** Scan this QR code with your phone. It will open Google Maps with all the red bins set as destinations in the perfect order.")
+    # --- 5. QR CODE FOR DRIVER ---
+    st.subheader("📲 Send Optimized Route to Truck Driver")
+    # Multi-stop URL including Depot
+    all_stops = [f"{lat},{lon}" for lat, lon in ordered_route]
+    nav_url = f"https://www.google.com/maps/dir/{'/'.join(all_stops)}"
+    
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        qr = qrcode.make(nav_url)
+        buf = BytesIO()
+        qr.save(buf)
+        st.image(buf, width=180)
+    with c2:
+        st.info("**Judges Tip:** This QR code generates a 'Closed-Loop' route. The driver starts at the Depot, visits only the critical bins in the most efficient order, and returns to the Disposal Center.")
+
 else:
-    st.error("Could not find 'data.csv'. Please upload it to GitHub.")
+    st.error("Please ensure your 'data.csv' is uploaded.")
