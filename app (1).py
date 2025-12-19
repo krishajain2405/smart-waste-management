@@ -8,12 +8,21 @@ import qrcode
 from io import BytesIO
 import os
 
-# --- 1. SETUP & CACHING ---
-st.set_page_config(page_title="Smart Waste AI Optimizer", layout="wide")
+# --- 1. SETUP & MULTI-TRUCK GARAGES ---
+st.set_page_config(page_title="AI Fleet Optimizer: Mumbai Waste", layout="wide")
+
+# We define 5 strategic Municipal Garages across Mumbai
+GARAGES = {
+    "Truck 1 (Worli)": (19.0178, 72.8478),
+    "Truck 2 (Bandra)": (19.0596, 72.8295),
+    "Truck 3 (Andheri)": (19.1136, 72.8697),
+    "Truck 4 (Kurla)": (19.0726, 72.8844),
+    "Truck 5 (Borivali)": (19.2307, 72.8567)
+}
+DEONAR_DUMPING = (19.0550, 72.9250) # Final Disposal Point
 
 @st.cache_data
-def load_data():
-    # Look for the file
+def load_and_clean_data():
     target = 'data.csv'
     if not os.path.exists(target):
         all_csvs = [f for f in os.listdir('.') if f.endswith('.csv')]
@@ -23,152 +32,151 @@ def load_data():
         df = pd.read_csv(target, sep=None, engine='python')
         df.columns = df.columns.str.strip()
         df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True, errors='coerce')
-        return df.dropna(subset=['timestamp', 'bin_fill_percent'])
-    except Exception as e:
-        st.error(f"Data Load Error: {e}")
-        return None
+        # Get latest status for 50 unique bins
+        return df.sort_values('timestamp').groupby('bin_id').tail(1)
+    except: return None
 
-@st.cache_resource
-def get_road_network():
-    # Mumbai center coordinates - Cached to prevent reloading lag
-    return ox.graph_from_point((19.0760, 72.8777), dist=8000, network_type='drive')
+def get_dist(p1, p2):
+    return ((p1[0]-p2[0])*2 + (p1[1]-p2[1])2)*0.5
 
-# --- 2. MULTI-TRUCK & DISPOSAL LOCATIONS ---
-GARAGES = {
-    "Truck 1 (Worli)": (19.0178, 72.8478),
-    "Truck 2 (Bandra)": (19.0596, 72.8295),
-    "Truck 3 (Andheri)": (19.1136, 72.8697),
-    "Truck 4 (Kurla)": (19.0726, 72.8844),
-    "Truck 5 (Borivali)": (19.2307, 72.8567)
-}
-DEONAR_DUMPING = (19.0550, 72.9250)
+# --- 2. ASSIGNMENT & ROUTING ENGINE ---
+def assign_bins_to_trucks(bins_df, garages):
+    """The Assignment Problem: Link each bin to the nearest garage."""
+    bins = bins_df.copy()
+    def find_nearest_truck(row):
+        bin_loc = (row['bin_location_lat'], row['bin_location_lon'])
+        # Find distance to all 5 garages
+        distances = {name: get_dist(bin_loc, coords) for name, coords in garages.items()}
+        return min(distances, key=distances.get) # Returns the name of the nearest truck
+    
+    bins['assigned_truck'] = bins.apply(find_nearest_truck, axis=1)
+    return bins
 
-# --- 3. NAVIGATION & APP LOGIC ---
-df = load_data()
+def calculate_truck_route(start_coords, end_coords, assigned_bins):
+    """Greedy Route for a specific truck: Garage -> Bins -> Deonar"""
+    current_pos = start_coords
+    unvisited = assigned_bins.copy()
+    route_points = [start_coords]
+    
+    # Limit to top 8 bins per truck to keep QR code stable (Google Maps limit)
+    unvisited = unvisited.sort_values('bin_fill_percent', ascending=False).head(8)
+    
+    while not unvisited.empty:
+        unvisited['d'] = unvisited.apply(lambda x: get_dist(current_pos, (x['bin_location_lat'], x['bin_location_lon'])), axis=1)
+        closest_idx = unvisited['d'].idxmin()
+        target = (unvisited.loc[closest_idx, 'bin_location_lat'], unvisited.loc[closest_idx, 'bin_location_lon'])
+        route_points.append(target)
+        current_pos = target
+        unvisited = unvisited.drop(closest_idx)
+    
+    route_points.append(end_coords)
+    return route_points
 
-if df is not None:
-    # Sidebar Navigation
-    page = st.sidebar.selectbox("Navigate to:", ["Home", "Route Optimization"])
+# --- 3. UI DASHBOARD ---
+st.title("🚛 Smart Waste Management: AI Multi-Fleet Dispatcher")
 
-    if page == "Home":
-        st.title("🏡 Smart Waste Management: AI Fleet Control")
-        st.write("### Project Overview")
-        st.write("""
-        Welcome to the Aavishkar Smart Waste Management Dashboard. 
-        This system solves the **Traveling Salesman Problem (TSP)** and the **Assignment Problem** to minimize fuel consumption and carbon emissions for Mumbai's waste fleet.
-        
-        **Key Features:**
-        - **Multi-Fleet Dispatch:** 5 trucks assigned to the nearest bins.
-        - **Dynamic Routing:** Real-time shortest path calculation using OpenStreetMap.
-        - **Driver Integration:** Scan QR codes to sync missions directly to Google Maps.
-        """)
-        st.image("https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&q=80&w=1000", caption="Optimizing City Logistics")
+df_latest = load_and_clean_data()
 
-    elif page == "Route Optimization":
-        st.title("🚛 AI Multi-Fleet Dispatcher & Navigation")
+if df_latest is not None:
+    # --- SIDEBAR CONTROLS ---
+    st.sidebar.header("Fleet Control Panel")
+    selected_truck = st.sidebar.selectbox("Select Active Truck to View Mission", list(GARAGES.keys()))
+    threshold = st.sidebar.slider("Urgency Threshold (Fill %)", 0, 100, 75)
+    
+    # Run the Assignment Logic
+    assigned_df = assign_bins_to_trucks(df_latest, GARAGES)
+    
+    # Filter for full bins assigned to the SELECTED TRUCK
+    truck_specific_bins = assigned_df[(assigned_df['assigned_truck'] == selected_truck) & 
+                                     (assigned_df['bin_fill_percent'] >= threshold)]
+    
+    # Calculate Mission Sequence
+    garage_loc = GARAGES[selected_truck]
+    mission_sequence = calculate_truck_route(garage_loc, DEONAR_DUMPING, truck_specific_bins)
 
-        # Sidebar Mission Controls
-        st.sidebar.header("Fleet Control Panel")
-        selected_truck = st.sidebar.selectbox("Active Truck", list(GARAGES.keys()))
-        threshold = st.sidebar.slider("Urgency Threshold (Fill %)", 0, 100, 75)
+    # Dashboard Stats
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active Mission", selected_truck)
+    c2.metric("Pickups Assigned", len(truck_specific_bins))
+    c3.metric("Goal", "Deonar Disposal Yard")
 
-        # THE "TIME TRAVEL" SLIDER
-        st.sidebar.subheader("📅 Simulation Time")
-        unique_times = sorted(df['timestamp'].unique())
-        default_idx = int(len(unique_times) * 0.75) # Set to a time where bins are usually full
-        sim_time = st.sidebar.select_slider("Select Time to View City Status", 
-                                            options=unique_times, 
-                                            value=unique_times[default_idx])
-        
-        # Snapshot for selected time
-        df_snapshot = df[df['timestamp'] == sim_time].copy()
+    # --- 4. MAP VISUALIZATION ---
+    @st.cache_resource
+    def load_road_network():
+        # Large area covering all garages to Deonar
+        return ox.graph_from_point((19.04, 72.88), dist=8000, network_type='drive')
 
-        # Logic: Assign nearest truck
-        def assign_nearest(row):
-            bin_loc = (row['bin_location_lat'], row['bin_location_lon'])
-            distances = {name: ((bin_loc[0]-g[0])**2 + (bin_loc[1]-g[1])**2)**0.5 for name, g in GARAGES.items()}
-            return min(distances, key=distances.get)
-
-        df_snapshot['assigned_truck'] = df_snapshot.apply(assign_nearest, axis=1)
-        
-        # Mission filtering
-        my_bins = df_snapshot[(df_snapshot['assigned_truck'] == selected_truck) & 
-                              (df_snapshot['bin_fill_percent'] >= threshold)]
-        
-        # Metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Vehicle ID", selected_truck)
-        c2.metric("Stops Assigned", len(my_bins))
-        c3.metric("Time Selected", sim_time.strftime('%H:%M %d-%m'))
-
-        # MAP
+    with st.spinner(f"AI is calculating the path for {selected_truck}..."):
         try:
-            G = get_road_network()
-            m = folium.Map(location=[19.0760, 72.8777], zoom_start=12, tiles="CartoDB positron")
+            G = load_road_network()
+            m = folium.Map(location=[19.04, 72.88], zoom_start=12, tiles="CartoDB positron")
 
-            # 1. Markers (Bins)
-            for _, row in df_snapshot.iterrows():
-                is_mine = (row['assigned_truck'] == selected_truck)
-                is_full = (row['bin_fill_percent'] >= threshold)
+            # 1. Plot all Garages
+            for name, coords in GARAGES.items():
+                is_selected = (name == selected_truck)
+                folium.Marker(coords, popup=name, 
+                              icon=folium.Icon(color='blue' if is_selected else 'gray', icon='truck', prefix='fa')).add_to(m)
+            
+            # 2. Plot Deonar
+            folium.Marker(DEONAR_DUMPING, popup="DEONAR DUMPING GROUND", 
+                          icon=folium.Icon(color='black', icon='home', prefix='fa')).add_to(m)
+
+            # 3. Draw Selected Truck Route
+            path_coords = []
+            for i in range(len(mission_sequence)-1):
+                try:
+                    n1 = ox.nearest_nodes(G, mission_sequence[i][1], mission_sequence[i][0])
+                    n2 = ox.nearest_nodes(G, mission_sequence[i+1][1], mission_sequence[i+1][0])
+                    route = nx.shortest_path(G, n1, n2, weight='length')
+                    path_coords.extend([[G.nodes[node]['y'], G.nodes[node]['x']] for node in route])
+                except:
+                    path_coords.append([mission_sequence[i][0], mission_sequence[i][1]])
+                    path_coords.append([mission_sequence[i+1][0], mission_sequence[i+1][1]])
+
+            if path_coords:
+                folium.PolyLine(path_coords, color="#e74c3c", weight=6, opacity=0.8).add_to(m)
+
+            # 4. Plot all Bins with Logic
+            for _, row in assigned_df.iterrows():
+                # Logic: Red if >= threshold AND assigned to the CURRENT TRUCK
+                # Green otherwise (or Orange if >= threshold but assigned to someone else)
+                is_full = row['bin_fill_percent'] >= threshold
+                is_mine = row['assigned_truck'] == selected_truck
                 
-                if is_full and is_mine: color = 'red'
-                elif is_full and not is_mine: color = 'orange'
-                else: color = 'green'
+                if is_full and is_mine: color = 'red' # My pickup
+                elif is_full and not is_mine: color = 'orange' # Other truck's pickup
+                else: color = 'green' # Not full
                 
                 folium.Marker(
-                    [row['bin_location_lat'], row['bin_location_lon']],
-                    popup=f"Bin {row['bin_id']}: {row['bin_fill_percent']}%",
+                    [row['bin_location_lat'], row['bin_location_lon']], 
+                    popup=f"Bin {row['bin_id']}: {row['bin_fill_percent']}% (Truck: {row['assigned_truck']})",
                     icon=folium.Icon(color=color, icon='trash', prefix='fa')
                 ).add_to(m)
 
-            # 2. Optimized Route
-            garage_loc = GARAGES[selected_truck]
-            if not my_bins.empty:
-                # Top 8 bins for QR stability
-                top_bins = my_bins.sort_values('bin_fill_percent', ascending=False).head(8)
-                mission_points = [garage_loc] + list(zip(top_bins['bin_location_lat'], top_bins['bin_location_lon'])) + [DEONAR_DUMPING]
-                
-                path_coords = []
-                for i in range(len(mission_points)-1):
-                    try:
-                        n1 = ox.nearest_nodes(G, mission_points[i][1], mission_points[i][0])
-                        n2 = ox.nearest_nodes(G, mission_points[i+1][1], mission_points[i+1][0])
-                        route = nx.shortest_path(G, n1, n2, weight='length')
-                        path_coords.extend([[G.nodes[node]['y'], G.nodes[node]['x']] for node in route])
-                    except:
-                        path_coords.append([mission_points[i][0], mission_points[i][1]])
-                        path_coords.append([mission_points[i+1][0], mission_points[i+1][1]])
-                
-                if path_coords:
-                    folium.PolyLine(path_coords, color="#3498db", weight=6, opacity=0.8).add_to(m)
-
-            # 3. Garages & Deonar
-            for name, coords in GARAGES.items():
-                folium.Marker(coords, popup=name, icon=folium.Icon(color='blue' if name == selected_truck else 'gray', icon='truck', prefix='fa')).add_to(m)
-            folium.Marker(DEONAR_DUMPING, popup="DEONAR DUMPING SITE", icon=folium.Icon(color='black', icon='home', prefix='fa')).add_to(m)
-
-            st_folium(m, width=1100, height=600, key="optimized_map")
-
-            # 4. QR Code
-            if not my_bins.empty:
-                st.subheader("📲 Driver Navigation Manifest")
-                origin = f"{garage_loc[0]},{garage_loc[1]}"
-                dest = f"{DEONAR_DUMPING[0]},{DEONAR_DUMPING[1]}"
-                waypoints = "|".join([f"{lat},{lon}" for lat, lon in zip(top_bins['bin_location_lat'], top_bins['bin_location_lon'])])
-                
-                google_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}&waypoints={waypoints}&travelmode=driving"
-                
-                qr_col, txt_col = st.columns([1, 3])
-                with qr_col:
-                    qr = qrcode.make(google_url)
-                    buf = BytesIO()
-                    qr.save(buf)
-                    st.image(buf, width=200)
-                with txt_col:
-                    st.success(f"Mission calculated for {selected_truck}.")
-                    st.write("**Judges Tip:** This QR code starts navigation from the specific garage, routes through the 8 most critical bins, and finishes at Deonar.")
+            st_folium(m, width=1200, height=550)
 
         except Exception as e:
-            st.error(f"Map Engine Initializing... {e}")
+            st.error(f"Map Error: {e}")
+
+    # --- 5. DRIVER NAVIGATION QR ---
+    if not truck_specific_bins.empty:
+        st.subheader(f"📲 Driver Navigation for {selected_truck}")
+        
+        origin = f"{garage_loc[0]},{garage_loc[1]}"
+        dest = f"{DEONAR_DUMPING[0]},{DEONAR_DUMPING[1]}"
+        # Waypoints are the bins specifically for this truck
+        waypoints = "|".join([f"{lat},{lon}" for lat, lon in mission_sequence[1:-1]])
+        
+        google_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}&waypoints={waypoints}&travelmode=driving"
+        
+        c_qr, c_txt = st.columns([1, 4])
+        with c_qr:
+            qr = qrcode.make(google_url)
+            buf = BytesIO()
+            qr.save(buf)
+            st.image(buf, width=180)
+        with c_txt:
+            st.success(f"Mission Ready: This route visits {len(truck_specific_bins)} bins assigned to you.")
+            st.info("*Presentation Tip:* Show the judges how the route only includes the *Red Bins. Notice how the **Orange Bins* are also full, but are assigned to a different truck to save fuel.")
 else:
-    st.error("⚠️ Data file not found. Ensure 'data.csv' is in your GitHub folder.")
+    st.error("Please upload your 'data.csv' to GitHub.")
