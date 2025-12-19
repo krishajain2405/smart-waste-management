@@ -7,4 +7,5 @@ streamlit-folium
 qrcode
 pillow
 scipy
-geopandas
+
+
